@@ -4,21 +4,27 @@ import cors from "cors";
 import fs from "fs/promises";
 import path from "path";
 import { v4 as uuidv4 } from "uuid";
-import jwt from "jsonwebtoken";
 import multer from "multer";
 import sqlite3 from "sqlite3";
 
 const __dirname = path.dirname(new URL(import.meta.url).pathname);
 const app = express();
-const port = process.env.PORT || 3000; // Use Render's PORT env variable
+const port = process.env.PORT || 3000;
 
 // Middleware
-app.use(cors());
 app.use(bodyParser.json());
 app.use(express.static("public"));
 
-// Secret key for JWT (should be in .env in production)
-const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
+// Disable CORS entirely (allow all origins, methods, headers)
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE");
+  res.header("Access-Control-Allow-Headers", "*");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200); // Respond to preflight requests immediately
+  }
+  next();
+});
 
 // SQLite database setup
 const dbPath = path.join(__dirname, "data", "chat.db");
@@ -27,7 +33,6 @@ const db = new sqlite3.Database(dbPath, (err) => {
     console.error("Error opening database:", err);
   } else {
     console.log("Database connected");
-    // Create tables if they don’t exist
     db.serialize(() => {
       db.run(`
         CREATE TABLE IF NOT EXISTS users (
@@ -111,20 +116,7 @@ const upload = multer({
   },
 });
 
-// Helper function to verify JWT
-const verifyAuth = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.sendStatus(401);
-
-  const token = authHeader.split(" ")[1];
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) return res.sendStatus(403);
-    req.user = user;
-    next();
-  });
-};
-
-// Promisify SQLite queries for async/await
+// Promisify SQLite queries
 const runQuery = (query, params = []) => {
   return new Promise((resolve, reject) => {
     db.run(query, params, function (err) {
@@ -154,7 +146,7 @@ const allQuery = (query, params = []) => {
 
 // --- Routes ---
 
-// Authentication Routes
+// Authentication Routes (No JWT verification)
 app.post("/api/auth/register", async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -175,7 +167,7 @@ app.post("/api/auth/register", async (req, res) => {
     const newUser = {
       id: uuidv4(),
       username,
-      password, // In production, hash this!
+      password, // No hashing for simplicity
       createdAt: new Date().toISOString(),
     };
 
@@ -184,8 +176,7 @@ app.post("/api/auth/register", async (req, res) => {
       [newUser.id, newUser.username, newUser.password, newUser.createdAt]
     );
 
-    const { password: _, ...userWithoutPassword } = newUser;
-    res.status(201).json(userWithoutPassword);
+    res.status(201).json({ id: newUser.id, username: newUser.username });
   } catch (error) {
     console.error("Register error:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -209,23 +200,23 @@ app.post("/api/auth/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    const token = jwt.sign(
-      { userId: user.id, username: user.username },
-      JWT_SECRET,
-      {
-        expiresIn: "24h",
-      }
-    );
-    res.json({ token });
+    res.json({ id: user.id, username: user.username }); // No token, just user info
   } catch (error) {
     console.error("Login error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// Chats Routes
-app.get("/api/chats", verifyAuth, async (req, res) => {
+// Chats Routes (No auth verification)
+app.get("/api/chats", async (req, res) => {
   try {
+    const { userId } = req.query; // Pass userId as query param
+    if (!userId) {
+      return res
+        .status(400)
+        .json({ error: "userId query parameter is required" });
+    }
+
     const chats = await allQuery(
       `
       SELECT c.*
@@ -233,7 +224,7 @@ app.get("/api/chats", verifyAuth, async (req, res) => {
       JOIN chat_participants cp ON c.id = cp.chatId
       WHERE cp.userId = ?
     `,
-      [req.user.userId]
+      [userId]
     );
     res.json(chats);
   } catch (error) {
@@ -242,14 +233,15 @@ app.get("/api/chats", verifyAuth, async (req, res) => {
   }
 });
 
-app.post("/api/chats", verifyAuth, async (req, res) => {
+app.post("/api/chats", async (req, res) => {
   try {
-    const { name, participants, type = "individual" } = req.body;
-    if (!participants || !Array.isArray(participants)) {
-      return res.status(400).json({ error: "Participants array is required" });
+    const { name, participants, type = "individual", createdBy } = req.body;
+    if (!participants || !Array.isArray(participants) || !createdBy) {
+      return res
+        .status(400)
+        .json({ error: "participants array and createdBy are required" });
     }
 
-    // Check for existing individual chat
     if (type === "individual" && participants.length === 2) {
       const existingChat = await getQuery(
         `
@@ -269,7 +261,7 @@ app.post("/api/chats", verifyAuth, async (req, res) => {
       id: uuidv4(),
       name: name || null,
       type,
-      createdBy: req.user.userId,
+      createdBy,
       createdAt: new Date().toISOString(),
     };
 
@@ -284,7 +276,6 @@ app.post("/api/chats", verifyAuth, async (req, res) => {
       ]
     );
 
-    // Add participants
     for (const userId of participants) {
       await runQuery(
         "INSERT INTO chat_participants (chatId, userId) VALUES (?, ?)",
@@ -299,8 +290,8 @@ app.post("/api/chats", verifyAuth, async (req, res) => {
   }
 });
 
-// Messages Routes
-app.get("/api/messages", verifyAuth, async (req, res) => {
+// Messages Routes (No auth verification)
+app.get("/api/messages", async (req, res) => {
   try {
     const { chatId } = req.query;
     if (!chatId) {
@@ -317,19 +308,19 @@ app.get("/api/messages", verifyAuth, async (req, res) => {
   }
 });
 
-app.post("/api/messages", verifyAuth, async (req, res) => {
+app.post("/api/messages", async (req, res) => {
   try {
-    const { chatId, content, type = "text" } = req.body;
-    if (!chatId || !content) {
+    const { chatId, content, senderId, type = "text" } = req.body;
+    if (!chatId || !content || !senderId) {
       return res
         .status(400)
-        .json({ error: "Chat ID and content are required" });
+        .json({ error: "chatId, content, and senderId are required" });
     }
 
     const newMessage = {
       id: uuidv4(),
       chatId,
-      senderId: req.user.userId,
+      senderId,
       content,
       type,
       status: "sent",
@@ -356,11 +347,16 @@ app.post("/api/messages", verifyAuth, async (req, res) => {
   }
 });
 
-// File Upload Route
-app.post("/api/upload", verifyAuth, upload.single("file"), async (req, res) => {
+// File Upload Route (No auth verification)
+app.post("/api/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    const { uploadedBy } = req.body; // Expect uploadedBy in form-data
+    if (!uploadedBy) {
+      return res.status(400).json({ error: "uploadedBy is required" });
     }
 
     const fileInfo = {
@@ -370,7 +366,7 @@ app.post("/api/upload", verifyAuth, upload.single("file"), async (req, res) => {
       path: `/uploads/${req.file.filename}`,
       size: req.file.size,
       mimetype: req.file.mimetype,
-      uploadedBy: req.user.userId,
+      uploadedBy,
       uploadedAt: new Date().toISOString(),
     };
 

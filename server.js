@@ -7,11 +7,10 @@ import { v4 as uuidv4 } from "uuid";
 import jwt from "jsonwebtoken";
 import multer from "multer";
 import sqlite3 from "sqlite3";
-import { open } from "sqlite";
 
 const __dirname = path.dirname(new URL(import.meta.url).pathname);
 const app = express();
-const port = process.env.PORT || 3000;
+const port = process.env.PORT || 3000; // Use Render's PORT env variable
 
 // Middleware
 app.use(cors());
@@ -23,61 +22,68 @@ const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
 
 // SQLite database setup
 const dbPath = path.join(__dirname, "data", "chat.db");
-let db;
-
-(async () => {
-  db = await open({
-    filename: dbPath,
-    driver: sqlite3.Database,
-  });
-
-  // Create tables if they don’t exist
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY,
-      username TEXT UNIQUE NOT NULL,
-      password TEXT NOT NULL,
-      createdAt TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS chats (
-      id TEXT PRIMARY KEY,
-      name TEXT,
-      type TEXT NOT NULL DEFAULT 'individual',
-      createdBy TEXT NOT NULL,
-      createdAt TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS chat_participants (
-      chatId TEXT,
-      userId TEXT,
-      FOREIGN KEY (chatId) REFERENCES chats(id),
-      FOREIGN KEY (userId) REFERENCES users(id),
-      PRIMARY KEY (chatId, userId)
-    );
-    CREATE TABLE IF NOT EXISTS messages (
-      id TEXT PRIMARY KEY,
-      chatId TEXT NOT NULL,
-      senderId TEXT NOT NULL,
-      content TEXT NOT NULL,
-      type TEXT NOT NULL DEFAULT 'text',
-      status TEXT NOT NULL DEFAULT 'sent',
-      createdAt TEXT NOT NULL,
-      FOREIGN KEY (chatId) REFERENCES chats(id),
-      FOREIGN KEY (senderId) REFERENCES users(id)
-    );
-    CREATE TABLE IF NOT EXISTS uploads (
-      id TEXT PRIMARY KEY,
-      filename TEXT NOT NULL,
-      originalName TEXT NOT NULL,
-      path TEXT NOT NULL,
-      size INTEGER NOT NULL,
-      mimetype TEXT NOT NULL,
-      uploadedBy TEXT NOT NULL,
-      uploadedAt TEXT NOT NULL,
-      FOREIGN KEY (uploadedBy) REFERENCES users(id)
-    );
-  `);
-  console.log("Database initialized");
-})();
+const db = new sqlite3.Database(dbPath, (err) => {
+  if (err) {
+    console.error("Error opening database:", err);
+  } else {
+    console.log("Database connected");
+    // Create tables if they don’t exist
+    db.serialize(() => {
+      db.run(`
+        CREATE TABLE IF NOT EXISTS users (
+          id TEXT PRIMARY KEY,
+          username TEXT UNIQUE NOT NULL,
+          password TEXT NOT NULL,
+          createdAt TEXT NOT NULL
+        )
+      `);
+      db.run(`
+        CREATE TABLE IF NOT EXISTS chats (
+          id TEXT PRIMARY KEY,
+          name TEXT,
+          type TEXT NOT NULL DEFAULT 'individual',
+          createdBy TEXT NOT NULL,
+          createdAt TEXT NOT NULL
+        )
+      `);
+      db.run(`
+        CREATE TABLE IF NOT EXISTS chat_participants (
+          chatId TEXT,
+          userId TEXT,
+          FOREIGN KEY (chatId) REFERENCES chats(id),
+          FOREIGN KEY (userId) REFERENCES users(id),
+          PRIMARY KEY (chatId, userId)
+        )
+      `);
+      db.run(`
+        CREATE TABLE IF NOT EXISTS messages (
+          id TEXT PRIMARY KEY,
+          chatId TEXT NOT NULL,
+          senderId TEXT NOT NULL,
+          content TEXT NOT NULL,
+          type TEXT NOT NULL DEFAULT 'text',
+          status TEXT NOT NULL DEFAULT 'sent',
+          createdAt TEXT NOT NULL,
+          FOREIGN KEY (chatId) REFERENCES chats(id),
+          FOREIGN KEY (senderId) REFERENCES users(id)
+        )
+      `);
+      db.run(`
+        CREATE TABLE IF NOT EXISTS uploads (
+          id TEXT PRIMARY KEY,
+          filename TEXT NOT NULL,
+          originalName TEXT NOT NULL,
+          path TEXT NOT NULL,
+          size INTEGER NOT NULL,
+          mimetype TEXT NOT NULL,
+          uploadedBy TEXT NOT NULL,
+          uploadedAt TEXT NOT NULL,
+          FOREIGN KEY (uploadedBy) REFERENCES users(id)
+        )
+      `);
+    });
+  }
+});
 
 // Configure multer for file uploads
 const uploadDir = path.join(__dirname, "uploads");
@@ -118,6 +124,34 @@ const verifyAuth = (req, res, next) => {
   });
 };
 
+// Promisify SQLite queries for async/await
+const runQuery = (query, params = []) => {
+  return new Promise((resolve, reject) => {
+    db.run(query, params, function (err) {
+      if (err) reject(err);
+      else resolve(this);
+    });
+  });
+};
+
+const getQuery = (query, params = []) => {
+  return new Promise((resolve, reject) => {
+    db.get(query, params, (err, row) => {
+      if (err) reject(err);
+      else resolve(row);
+    });
+  });
+};
+
+const allQuery = (query, params = []) => {
+  return new Promise((resolve, reject) => {
+    db.all(query, params, (err, rows) => {
+      if (err) reject(err);
+      else resolve(rows);
+    });
+  });
+};
+
 // --- Routes ---
 
 // Authentication Routes
@@ -130,9 +164,9 @@ app.post("/api/auth/register", async (req, res) => {
         .json({ error: "Username and password are required" });
     }
 
-    const existingUser = await db.get(
+    const existingUser = await getQuery(
       "SELECT * FROM users WHERE username = ?",
-      username
+      [username]
     );
     if (existingUser) {
       return res.status(400).json({ error: "Username already exists" });
@@ -145,7 +179,7 @@ app.post("/api/auth/register", async (req, res) => {
       createdAt: new Date().toISOString(),
     };
 
-    await db.run(
+    await runQuery(
       "INSERT INTO users (id, username, password, createdAt) VALUES (?, ?, ?, ?)",
       [newUser.id, newUser.username, newUser.password, newUser.createdAt]
     );
@@ -167,7 +201,7 @@ app.post("/api/auth/login", async (req, res) => {
         .json({ error: "Username and password are required" });
     }
 
-    const user = await db.get(
+    const user = await getQuery(
       "SELECT * FROM users WHERE username = ? AND password = ?",
       [username, password]
     );
@@ -192,7 +226,7 @@ app.post("/api/auth/login", async (req, res) => {
 // Chats Routes
 app.get("/api/chats", verifyAuth, async (req, res) => {
   try {
-    const chats = await db.all(
+    const chats = await allQuery(
       `
       SELECT c.*
       FROM chats c
@@ -217,7 +251,7 @@ app.post("/api/chats", verifyAuth, async (req, res) => {
 
     // Check for existing individual chat
     if (type === "individual" && participants.length === 2) {
-      const existingChat = await db.get(
+      const existingChat = await getQuery(
         `
         SELECT c.*
         FROM chats c
@@ -239,7 +273,7 @@ app.post("/api/chats", verifyAuth, async (req, res) => {
       createdAt: new Date().toISOString(),
     };
 
-    await db.run(
+    await runQuery(
       "INSERT INTO chats (id, name, type, createdBy, createdAt) VALUES (?, ?, ?, ?, ?)",
       [
         newChat.id,
@@ -252,7 +286,7 @@ app.post("/api/chats", verifyAuth, async (req, res) => {
 
     // Add participants
     for (const userId of participants) {
-      await db.run(
+      await runQuery(
         "INSERT INTO chat_participants (chatId, userId) VALUES (?, ?)",
         [newChat.id, userId]
       );
@@ -273,7 +307,7 @@ app.get("/api/messages", verifyAuth, async (req, res) => {
       return res.status(400).json({ error: "Chat ID is required" });
     }
 
-    const messages = await db.all("SELECT * FROM messages WHERE chatId = ?", [
+    const messages = await allQuery("SELECT * FROM messages WHERE chatId = ?", [
       chatId,
     ]);
     res.json(messages);
@@ -302,7 +336,7 @@ app.post("/api/messages", verifyAuth, async (req, res) => {
       createdAt: new Date().toISOString(),
     };
 
-    await db.run(
+    await runQuery(
       "INSERT INTO messages (id, chatId, senderId, content, type, status, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)",
       [
         newMessage.id,
@@ -340,7 +374,7 @@ app.post("/api/upload", verifyAuth, upload.single("file"), async (req, res) => {
       uploadedAt: new Date().toISOString(),
     };
 
-    await db.run(
+    await runQuery(
       "INSERT INTO uploads (id, filename, originalName, path, size, mimetype, uploadedBy, uploadedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       [
         fileInfo.id,
@@ -367,4 +401,13 @@ app.use("/uploads", express.static(uploadDir));
 // Start the server
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
+});
+
+// Cleanup on process exit
+process.on("SIGINT", () => {
+  db.close((err) => {
+    if (err) console.error("Error closing database:", err);
+    console.log("Database connection closed");
+    process.exit(0);
+  });
 });

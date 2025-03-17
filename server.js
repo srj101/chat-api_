@@ -5,6 +5,7 @@ import fs from "fs/promises";
 import path from "path";
 import { v4 as uuidv4 } from "uuid";
 import jwt from "jsonwebtoken";
+import multer from "multer"; // Added for file uploads
 
 const __dirname = path.dirname(new URL(import.meta.url).pathname);
 const app = express();
@@ -17,6 +18,37 @@ app.use(express.static("public"));
 
 // Secret key for JWT (should be in .env in production)
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
+
+// Configure multer for file uploads
+const uploadDir = path.join(__dirname, "uploads");
+const storage = multer.diskStorage({
+  destination: async (req, file, cb) => {
+    await fs.mkdir(uploadDir, { recursive: true }); // Ensure upload directory exists
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    const uniqueName = `${uuidv4()}-${file.originalname}`; // Unique filename
+    cb(null, uniqueName);
+  },
+});
+
+// 100 KB limit
+const upload = multer({
+  storage,
+  limits: { fileSize: 100000 }, // 100 KB limit
+  fileFilter: (req, file, cb) => {
+    // Optional: Restrict file types (e.g., images, PDFs)
+    const allowedTypes = /jpeg|jpg|png|gif|pdf/;
+    const extname = allowedTypes.test(
+      path.extname(file.originalname).toLowerCase()
+    );
+    const mimetype = allowedTypes.test(file.mimetype);
+    if (extname && mimetype) {
+      return cb(null, true);
+    }
+    cb(new Error("Only images and PDFs are allowed"));
+  },
+});
 
 // Helper function to verify JWT
 const verifyAuth = (req, res, next) => {
@@ -230,18 +262,42 @@ app.post("/api/messages", verifyAuth, async (req, res) => {
   }
 });
 
-// File Upload Route (Placeholder)
-app.post("/api/upload", verifyAuth, async (req, res) => {
+// File Upload Route
+app.post("/api/upload", verifyAuth, upload.single("file"), async (req, res) => {
   try {
-    // Placeholder - file uploads require middleware like multer in a real environment
-    res
-      .status(500)
-      .json({ error: "File upload not implemented in this environment" });
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    const fileInfo = {
+      id: uuidv4(),
+      filename: req.file.filename,
+      originalName: req.file.originalname,
+      path: `/uploads/${req.file.filename}`, // Relative path for frontend access
+      size: req.file.size,
+      mimetype: req.file.mimetype,
+      uploadedBy: req.user.userId,
+      uploadedAt: new Date().toISOString(),
+    };
+
+    // Optionally store file metadata in a JSON file
+    const uploadsPath = path.join(__dirname, "data", "uploads.json");
+    await ensureFileExists(uploadsPath);
+
+    let uploads = JSON.parse(await fs.readFile(uploadsPath, "utf8"));
+    if (!Array.isArray(uploads)) uploads = [];
+    uploads.push(fileInfo);
+    await fs.writeFile(uploadsPath, JSON.stringify(uploads, null, 2));
+
+    res.status(201).json(fileInfo);
   } catch (error) {
     console.error("Upload error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
+// Serve uploaded files statically
+app.use("/uploads", express.static(uploadDir));
 
 // Start the server
 app.listen(port, () => {
